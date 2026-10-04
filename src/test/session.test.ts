@@ -226,6 +226,93 @@ describe("会话：断点前后状态", () => {
   });
 });
 
+describe("会话：条件断点", () => {
+  /** 停在 b 的第一次访问（副作用前 i===0）。 */
+  const RULE = [{ nodeId: "b", variable: "i", equals: 0, hit: 1 }];
+
+  it("条件配置属于执行代次：旧代次的配置命令被拒绝且不生效", async () => {
+    const { session, last } = makeSession(1000);
+    session.loadGraph(LOOP_GRAPH);
+    const gen1 = session.generation;
+    session.loadGraph(LOOP_GRAPH);
+    const gen2 = session.generation;
+
+    const stale = session.setConditionalBreakpoints(RULE, gen1);
+    expect(stale.ok).toBe(false);
+    expect((stale as { error: string }).error).toMatch(/stale-generation/);
+
+    // 旧配置未生效：新代次一路跑到结束
+    await session.continue(gen2);
+    expect(last().status).toBe("done");
+
+    // 当前代次的配置正常（需先 reset）
+    expect(session.reset(gen2)).toEqual({ ok: true });
+    expect(session.setConditionalBreakpoints(RULE, gen2)).toEqual({ ok: true });
+    await session.continue(gen2);
+    expect(last().status).toBe("breakpoint");
+    expect(last().pendingBreakpoint).toEqual({ coroutineId: 1, nodeId: "b" });
+    expect(last().variables.i).toBe(0); // 副作用尚未发生
+  });
+
+  it("加载/编辑图清除旧执行的条件配置", async () => {
+    const { session, last } = makeSession(1000);
+    session.loadGraph(LOOP_GRAPH);
+    const gen1 = session.generation;
+    expect(session.setConditionalBreakpoints(RULE, gen1)).toEqual({ ok: true });
+    await session.continue(gen1);
+    expect(last().status).toBe("breakpoint"); // 规则生效
+
+    session.loadGraph(LOOP_GRAPH); // 新代次
+    const gen2 = session.generation;
+    await session.continue(gen2);
+    expect(last().status).toBe("done"); // 旧规则不再影响新流程
+    expect(last().variables.i).toBe(8);
+  });
+
+  it("reset 保留当前规则", async () => {
+    const { session, last } = makeSession(1000);
+    session.loadGraph(LOOP_GRAPH);
+    const gen = session.generation;
+    session.setConditionalBreakpoints(RULE, gen);
+    await session.continue(gen);
+    expect(last().status).toBe("breakpoint");
+
+    expect(session.reset(gen)).toEqual({ ok: true });
+    expect(last().status).toBe("idle");
+    await session.continue(gen);
+    expect(last().status).toBe("breakpoint"); // 规则仍在，再次停住
+    expect(last().pendingBreakpoint).toEqual({ coroutineId: 1, nodeId: "b" });
+    expect(last().variables.i).toBe(0);
+  });
+
+  it("执行事件后须先 reset 才能改配置", () => {
+    const { session } = makeSession();
+    session.loadGraph(LOOP_GRAPH);
+    const gen = session.generation;
+    session.step(gen);
+    const r = session.setConditionalBreakpoints(RULE, gen);
+    expect(r.ok).toBe(false);
+    expect((r as { error: string }).error).toMatch(/reset/);
+    expect(session.reset(gen)).toEqual({ ok: true });
+    expect(session.setConditionalBreakpoints(RULE, gen)).toEqual({ ok: true });
+  });
+
+  it("非法规则被拒绝且不影响已生效的规则", async () => {
+    const { session, last } = makeSession(1000);
+    session.loadGraph(LOOP_GRAPH);
+    const gen = session.generation;
+    expect(session.setConditionalBreakpoints(RULE, gen)).toEqual({ ok: true });
+    const bad = session.setConditionalBreakpoints(
+      [{ nodeId: "ghost", variable: "i", equals: 0, hit: 1 }],
+      gen,
+    );
+    expect(bad.ok).toBe(false);
+    await session.continue(gen);
+    expect(last().status).toBe("breakpoint"); // 旧规则仍然生效
+    expect(last().pendingBreakpoint!.nodeId).toBe("b");
+  });
+});
+
 describe("会话：回退", () => {
   it("回退到历史事件后状态一致，且可重新前进", async () => {
     const { session, pump, last } = makeSession(100);

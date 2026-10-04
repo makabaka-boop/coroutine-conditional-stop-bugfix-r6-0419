@@ -121,6 +121,33 @@ describe("Worker 协议", () => {
     });
   });
 
+  it("条件断点：配置携带代次，旧代次被拒绝；加载新图清除规则", async () => {
+    const RULES = [{ nodeId: "a", variable: "x", equals: 0, hit: 1 }];
+    worker.send({ type: "loadGraph", graph: ASSIGN_GRAPH });
+    worker.send({ type: "setConditionalBreakpoints", generation: 1, rules: RULES });
+    expect(worker.results().at(-1)!.ok).toBe(true);
+
+    worker.send({ type: "continue", generation: 1 });
+    await vi.waitFor(() => {
+      expect(worker.lastState().status).toBe("breakpoint");
+    });
+    expect(worker.lastState().variables.x).toBe(0); // 停在副作用前
+
+    // 编辑图 → 新代次，旧规则被清除
+    worker.send({ type: "loadGraph", graph: ASSIGN_GRAPH });
+    // 旧代次的配置命令被拒绝
+    worker.send({ type: "setConditionalBreakpoints", generation: 1, rules: RULES });
+    const rejected = worker.results().at(-1)!;
+    expect(rejected.ok).toBe(false);
+    expect(rejected.error).toMatch(/stale-generation/);
+
+    // 新代次无规则：一路跑到结束
+    worker.send({ type: "continue", generation: 2 });
+    await vi.waitFor(() => {
+      expect(worker.lastState().status).toBe("done");
+    });
+  });
+
   it("非法图返回错误且不改变状态", () => {
     worker.send({ type: "loadGraph", graph: ASSIGN_GRAPH });
     worker.send({

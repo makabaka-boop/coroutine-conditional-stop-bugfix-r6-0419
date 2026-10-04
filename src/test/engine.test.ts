@@ -88,6 +88,53 @@ function loopGraph(): FlowGraph {
   });
 }
 
+/** 同 loopGraph，但多一个恒为 0 的变量 k（条件断点观察用）。 */
+function condLoopGraph(): FlowGraph {
+  return validateGraph({
+    variables: { i: 0, k: 0 },
+    start: "s",
+    nodes: [
+      { id: "s", kind: "start", next: "L" },
+      { id: "L", kind: "loop", count: lit(3), body: "body", next: "e" },
+      {
+        id: "body",
+        kind: "assign",
+        target: "i",
+        expr: bin("+", v("i"), lit(1)),
+        next: "L",
+      },
+      { id: "e", kind: "end" },
+    ],
+  });
+}
+
+/** main 与子协程穿过同一个节点 sh：s → spawn(sh) → sh；sh: x=x+1 → cnd(x<4 ? sh : e) */
+function sharedNodeGraph(): FlowGraph {
+  return validateGraph({
+    variables: { x: 0, k: 0 },
+    start: "s",
+    nodes: [
+      { id: "s", kind: "start", next: "sp" },
+      { id: "sp", kind: "spawn", entry: "sh", next: "sh" },
+      {
+        id: "sh",
+        kind: "assign",
+        target: "x",
+        expr: bin("+", v("x"), lit(1)),
+        next: "cnd",
+      },
+      {
+        id: "cnd",
+        kind: "condition",
+        expr: bin("<", v("x"), lit(4)),
+        onTrue: "sh",
+        onFalse: "e",
+      },
+      { id: "e", kind: "end" },
+    ],
+  });
+}
+
 /** 死循环：start → L(loop 1){cond true → L}… 实际用 condition 自环 */
 function infiniteGraph(): FlowGraph {
   return validateGraph({
@@ -139,6 +186,38 @@ function runToEnd(engine: Engine): void {
   ) {
     engine.stepEvent();
   }
+}
+
+interface StopRecord {
+  coroutineId: number;
+  nodeId: string;
+  eventsExecuted: number;
+  /** 停住时该协程对此节点已完成的访问次数（轨迹可查）。 */
+  priorVisits: number;
+}
+
+/** 一路推进到 done/terminated，途中每次断点停顿都记录下来并立即恢复。 */
+function runCollectingStops(engine: Engine): StopRecord[] {
+  const stops: StopRecord[] = [];
+  for (
+    let i = 0;
+    i < 20000 && engine.status !== "done" && engine.status !== "terminated";
+    i++
+  ) {
+    engine.stepEvent();
+    if (engine.status === "breakpoint") {
+      const p = engine.pendingBreakpoint!;
+      stops.push({
+        coroutineId: p.coroutineId,
+        nodeId: p.nodeId,
+        eventsExecuted: engine.eventsExecuted,
+        priorVisits: engine.trace.filter(
+          (t) => t.coroutine === p.coroutineId && t.node === p.nodeId,
+        ).length,
+      });
+    }
+  }
+  return stops;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,8 +374,126 @@ describe("引擎：断点", () => {
   });
 });
 
-describe("引擎：检查点回退与确定性重放", () => {
-  it("回退到任意事件后，状态与首次执行到该点时完全一致", () => {
+describe("引擎：条件断点", () => {
+  it("条件观察副作用前的变量；只计条件成立的访问", () => {
+    // i===2 只成立一次，hit:2 永远达不到 → 不停
+    const never = new Engine(condLoopGraph(), {
+      conditionalRules: [{ nodeId: "body", variable: "i", equals: 2, hit: 2 }],
+    });
+    runToEnd(never);
+    expect(never.status).toBe("done");
+    expect(never.variables.i).toBe(3);
+
+    // hit:1 → 在条件成立的那次访问前停住；停住时变量仍是使条件成立的值
+    const engine = new Engine(condLoopGraph(), {
+      conditionalRules: [{ nodeId: "body", variable: "i", equals: 2, hit: 1 }],
+    });
+    for (let i = 0; i < 100 && engine.status !== "breakpoint"; i++)
+      engine.stepEvent();
+    expect(engine.status).toBe("breakpoint");
+    expect(engine.pendingBreakpoint).toEqual({ coroutineId: 1, nodeId: "body" });
+    expect(engine.variables.i).toBe(2); // 第 3 次访问的副作用尚未发生
+    expect(engine.eventsExecuted).toBe(6);
+    // 轨迹可解释此次命中：此前恰有 2 次 body 执行（i: 0→1→2）
+    expect(engine.trace.filter((t) => t.node === "body").length).toBe(2);
+    // 恢复后副作用恰好生效一次
+    engine.stepEvent();
+    expect(engine.variables.i).toBe(3);
+    runToEnd(engine);
+    expect(engine.status).toBe("done");
+  });
+
+  it("各协程独立计数：穿过同一节点的协程各自在第 hit 次有效访问停住", () => {
+    const engine = new Engine(sharedNodeGraph(), {
+      conditionalRules: [{ nodeId: "sh", variable: "k", equals: 0, hit: 2 }],
+    });
+    const stops = runCollectingStops(engine);
+    expect(engine.status).toBe("done");
+    expect(engine.variables.x).toBe(4);
+    expect(engine.eventsExecuted).toBe(12);
+    // 两个协程各停一次：停住时各自恰好已完成 hit-1 次访问
+    expect(stops).toEqual([
+      { coroutineId: 2, nodeId: "sh", eventsExecuted: 6, priorVisits: 1 },
+      { coroutineId: 1, nodeId: "sh", eventsExecuted: 7, priorVisits: 1 },
+    ]);
+  });
+
+  it("普通断点拦下的访问也恰好计一次（执行时计数）", () => {
+    const engine = new Engine(condLoopGraph(), {
+      breakpoints: new Set(["body"]),
+      conditionalRules: [{ nodeId: "body", variable: "k", equals: 0, hit: 2 }],
+    });
+    const stops = runCollectingStops(engine);
+    expect(engine.status).toBe("done");
+    expect(stops.length).toBe(3); // 普通断点每次迭代都停
+    // 每次访问在真正执行时恰好计一次，与是否先被拦下无关
+    expect(engine.conditional.counts).toEqual({ "1:body": 3 });
+  });
+
+  it("恢复执行恰好执行一次待执行节点；回退恢复计数且重放不停顿", () => {
+    const engine = new Engine(condLoopGraph(), {
+      conditionalRules: [{ nodeId: "body", variable: "k", equals: 0, hit: 2 }],
+    });
+    // 第一次运行：停在第 2 次有效访问（事件 5）之前
+    for (let i = 0; i < 100 && engine.status !== "breakpoint"; i++)
+      engine.stepEvent();
+    expect(engine.eventsExecuted).toBe(4);
+    expect(engine.pendingBreakpoint).toEqual({ coroutineId: 1, nodeId: "body" });
+    expect(engine.variables.i).toBe(1);
+    expect(engine.conditional.counts).toEqual({ "1:body": 1 });
+
+    // 恢复：待执行节点恰好执行一次（事件数 +1，副作用只生效一次）
+    expect(engine.stepEvent()).toBe("executed");
+    expect(engine.eventsExecuted).toBe(5);
+    expect(engine.variables.i).toBe(2);
+    expect(engine.conditional.counts).toEqual({ "1:body": 2 });
+    engine.stepEvent(); // 事件 6（loop 回边）
+    expect(engine.eventsExecuted).toBe(6);
+
+    // 回退到计数发生之前：计数随检查点恢复，重跑停在同一位置
+    engine.rollback(2);
+    expect(engine.conditional.counts).toEqual({});
+    for (let i = 0; i < 100 && engine.status !== "breakpoint"; i++)
+      engine.stepEvent();
+    expect(engine.status).toBe("breakpoint");
+    expect(engine.eventsExecuted).toBe(4); // 与首次运行相同
+    expect(engine.pendingBreakpoint).toEqual({ coroutineId: 1, nodeId: "body" });
+    expect(engine.variables.i).toBe(1);
+
+    // 回退到越过停点的位置：重放经过停点但不在条件上停顿，计数确定性重建
+    engine.rollback(6);
+    expect(engine.eventsExecuted).toBe(6);
+    expect(engine.status).toBe("ready");
+    expect(engine.conditional.counts).toEqual({ "1:body": 2 });
+
+    // 第 3 次访问不再停（hit:2 已消费），一路到结束
+    runToEnd(engine);
+    expect(engine.status).toBe("done");
+    expect(engine.variables.i).toBe(3);
+    expect(engine.eventsExecuted).toBe(9);
+  });
+
+  it("非法条件规则在加载时被拒绝", () => {
+    expect(
+      () =>
+        new Engine(condLoopGraph(), {
+          conditionalRules: [
+            { nodeId: "ghost", variable: "k", equals: 0, hit: 1 },
+          ],
+        }),
+    ).toThrowError(/invalid conditional breakpoint/);
+    expect(
+      () =>
+        new Engine(condLoopGraph(), {
+          conditionalRules: [
+            { nodeId: "body", variable: "k", equals: 0, hit: 0 },
+          ],
+        }),
+    ).toThrowError(/invalid conditional breakpoint/);
+  });
+});
+
+describe("引擎：检查点回退与确定性重放", () => {  it("回退到任意事件后，状态与首次执行到该点时完全一致", () => {
     const graph = validateGraph({
       variables: { i: 0, acc: 0 },
       start: "s",

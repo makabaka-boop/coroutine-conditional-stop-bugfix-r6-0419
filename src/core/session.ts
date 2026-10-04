@@ -68,6 +68,8 @@ export class DebuggerSession {
     this.running = false;
     this.pauseRequested = false;
     this.graph = graph;
+    // 条件断点配置属于旧执行代次：新图一律清除（reset 才会保留当前规则）
+    this.engineOptions.conditionalRules = undefined;
     // 过滤掉不属于新图的断点
     const known = new Set(graph.nodes.map((n) => n.id));
     this.breakpoints = new Set(
@@ -179,10 +181,17 @@ export class DebuggerSession {
     return OK;
   }
 
+  /**
+   * 设置条件断点（属于当前执行代次；旧代次的配置命令一律拒绝）。
+   * 只能在未执行任何事件时调用（先 reset）；新规则在新引擎上生效，
+   * 校验失败时保留旧规则与旧引擎。
+   */
   setConditionalBreakpoints(
     rules: ConditionalRule[],
     generation?: number,
   ): CmdResult {
+    const stale = this.checkGeneration(generation);
+    if (stale) return stale;
     if (!this.engine || !this.graph)
       return { ok: false, error: "no graph loaded" };
     if (this.running || this.engine.eventsExecuted !== 0)
@@ -193,7 +202,10 @@ export class DebuggerSession {
       this.engine = this.freshEngine();
     } catch (err) {
       this.engineOptions.conditionalRules = prior;
-      return { ok: false, error: String(err) };
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
     }
     this.emit();
     return OK;

@@ -28,6 +28,8 @@ interface Checkpoint {
   variables: Record<string, number>;
   coroutines: Coroutine[];
   readyQueue: number[];
+  /** 条件断点：各 (协程, 节点) 的有效访问计数（随状态一起回退/重放）。 */
+  conditionalCounts: Record<string, number>;
 }
 
 /**
@@ -400,6 +402,7 @@ export class Engine {
       variables: { ...this.variables },
       coroutines: structuredClone([...this.coroutines.values()]),
       readyQueue: [...this.readyQueue],
+      conditionalCounts: { ...this.conditional.counts },
     };
     const existing = this.checkpoints.findIndex(
       (c) => c.eventsExecuted === cp.eventsExecuted,
@@ -419,7 +422,7 @@ export class Engine {
    * 回退到第 to 个事件之后的状态：恢复最近检查点，再确定性重放到 to。
    * to 可取 [0, 历史到达过的最大事件数] 中的任意值——调度是图的纯函数，
    * 检查点与事件日志永不失效，因此可以回退也可以“前进”到曾到达的点。
-   * 断点不参与重放。
+   * 断点不参与重放；条件断点的有效访问计数随检查点恢复、随重放确定性重建。
    */
   rollback(to: number): void {
     if (to < 0 || to > this.highWaterMark) {
@@ -437,6 +440,7 @@ export class Engine {
     this.tick = cp.tick;
     this.nextCoroutineId = cp.nextCoroutineId;
     this.variables = { ...cp.variables };
+    this.conditional.counts = { ...cp.conditionalCounts };
     this.coroutines = new Map(
       structuredClone(cp.coroutines).map((c) => [c.id, c] as const),
     );
