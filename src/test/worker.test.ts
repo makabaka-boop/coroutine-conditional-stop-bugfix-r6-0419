@@ -121,6 +121,58 @@ describe("Worker 协议", () => {
     });
   });
 
+  it("条件断点配置携带代次号：旧代次配置被拒绝，加载新图清除旧配置", () => {
+    const loopGraph = {
+      variables: { zero: 0, i: 0 },
+      start: "s",
+      nodes: [
+        { id: "s", kind: "start", next: "L" },
+        {
+          id: "L",
+          kind: "loop",
+          count: { kind: "lit", value: 2 },
+          body: "b",
+          next: "e",
+        },
+        {
+          id: "b",
+          kind: "assign",
+          target: "i",
+          expr: {
+            kind: "bin",
+            op: "+",
+            left: { kind: "var", name: "i" },
+            right: { kind: "lit", value: 1 },
+          },
+          next: "L",
+        },
+        { id: "e", kind: "end" },
+      ],
+    };
+    const rule = [{ nodeId: "L", variable: "zero", equals: 0, hit: 1 }];
+
+    worker.send({ type: "loadGraph", graph: loopGraph });
+    expect(worker.lastState().generation).toBe(1);
+    worker.send({ type: "setConditionalBreakpoints", generation: 1, rules: rule });
+    expect(worker.results().at(-1)!.ok).toBe(true);
+
+    // 编辑图 → 代次 2
+    worker.send({ type: "loadGraph", graph: loopGraph });
+    expect(worker.lastState().generation).toBe(2);
+
+    // 旧代次的条件配置被拒绝
+    worker.send({ type: "setConditionalBreakpoints", generation: 1, rules: rule });
+    const denied = worker.results().at(-1)!;
+    expect(denied.ok).toBe(false);
+    expect(denied.error).toMatch(/stale-generation/);
+
+    // 旧规则已随新图清除：一路跑到结束，不在 L 上停
+    worker.send({ type: "continue", generation: 2 });
+    return vi.waitFor(() => {
+      expect(worker.lastState().status).toBe("done");
+    });
+  });
+
   it("非法图返回错误且不改变状态", () => {
     worker.send({ type: "loadGraph", graph: ASSIGN_GRAPH });
     worker.send({

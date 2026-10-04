@@ -28,6 +28,8 @@ interface Checkpoint {
   variables: Record<string, number>;
   coroutines: Coroutine[];
   readyQueue: number[];
+  /** 各协程的条件断点有效访问计数（回退后必须原样恢复）。 */
+  conditionalCounts: Record<string, number>;
 }
 
 /**
@@ -219,7 +221,8 @@ export class Engine {
     const c = this.coroutines.get(cid)!;
     const node = this.nodeOf(c.pc);
 
-    this.conditional.visit(node.id, cid, this.variables);
+    // 在副作用之前记录这次访问（noteVisit 观察的是副作用前的变量）。
+    this.conditional.noteVisit(node.id, cid, this.variables);
     let note = "";
     try {
       note = this.applyNode(c, node);
@@ -400,6 +403,7 @@ export class Engine {
       variables: { ...this.variables },
       coroutines: structuredClone([...this.coroutines.values()]),
       readyQueue: [...this.readyQueue],
+      conditionalCounts: this.conditional.snapshotCounts(),
     };
     const existing = this.checkpoints.findIndex(
       (c) => c.eventsExecuted === cp.eventsExecuted,
@@ -445,6 +449,9 @@ export class Engine {
     this.status = this.eventsExecuted === 0 ? "idle" : "ready";
     this.terminateReason = null;
     this.trace.length = cp.eventsExecuted;
+    // 有效访问计数恢复到检查点时刻；随后的确定性重放只把计数重新累积到 to，
+    // 不会把旧运行的计数叠加进来，也不会在条件断点上停顿。
+    this.conditional.restoreCounts(cp.conditionalCounts);
 
     // 确定性重放（execute 内部会对照事件日志校验调度序列）。
     while (this.eventsExecuted < to) {

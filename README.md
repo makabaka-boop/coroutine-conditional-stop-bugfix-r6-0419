@@ -8,7 +8,7 @@ Svelte + TypeScript Worker 实现的确定性流程图调试器。图最多 **30
 ```bash
 npm install
 npm run dev      # 开发服务器
-npm test         # 运行测试（vitest，28 个用例）
+npm test         # 运行测试（vitest，42 个用例）
 npm run check    # TypeScript 类型检查
 npm run build    # 生产构建
 ```

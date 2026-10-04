@@ -226,6 +226,157 @@ describe("会话：断点前后状态", () => {
   });
 });
 
+describe("会话：条件断点", () => {
+  const COND_GRAPH = {
+    variables: { zero: 0, i: 0 },
+    start: "s",
+    nodes: [
+      { id: "s", kind: "start", next: "L" },
+      { id: "L", kind: "loop", count: lit(4), body: "b", next: "e" },
+      {
+        id: "b",
+        kind: "assign",
+        target: "i",
+        expr: bin("+", v("i"), lit(1)),
+        next: "L",
+      },
+      { id: "e", kind: "end" },
+    ],
+  };
+
+  it("配置命令校验代次：旧代次的条件配置被拒绝", () => {
+    const { session } = makeSession();
+    session.loadGraph(COND_GRAPH);
+    const gen1 = session.generation;
+    session.loadGraph(COND_GRAPH); // 编辑 → 新代次
+    const gen2 = session.generation;
+
+    const stale = session.setConditionalBreakpoints(
+      [{ nodeId: "L", variable: "zero", equals: 0, hit: 1 }],
+      gen1,
+    );
+    expect(stale.ok).toBe(false);
+    expect((stale as { error: string }).error).toMatch(/stale-generation/);
+    // 旧配置没有触碰新代次状态
+    expect(session.getSnapshot()!.eventsExecuted).toBe(0);
+
+    // 新代次配置生效
+    expect(
+      session.setConditionalBreakpoints(
+        [{ nodeId: "L", variable: "zero", equals: 0, hit: 1 }],
+        gen2,
+      ),
+    ).toEqual({ ok: true });
+  });
+
+  it("重置保留条件规则；加载新图清除条件规则", () => {
+    const { session, last } = makeSession();
+    session.loadGraph(COND_GRAPH);
+    const gen = session.generation;
+    const rule = [{ nodeId: "L", variable: "zero", equals: 0, hit: 1 }];
+    expect(session.setConditionalBreakpoints(rule, gen)).toEqual({ ok: true });
+
+    // 跑到命中、再跑几步后重置：规则仍然有效（reset 不清规则）
+    session.step(gen); // s
+    expect(session.step(gen)).toEqual({ ok: true }); // 命中 L（第1次有效访问）
+    expect(last().status).toBe("breakpoint");
+    session.step(gen); // 批准
+    expect(session.reset(gen)).toEqual({ ok: true });
+    expect(last().status).toBe("idle");
+    // 重置后规则仍在：第一次到 L 照样停
+    session.step(gen); // s
+    expect(session.step(gen)).toEqual({ ok: true });
+    expect(last().status).toBe("breakpoint");
+    expect(last().pendingBreakpoint!.nodeId).toBe("L");
+
+    // 编辑图（同一代次+1）：旧规则不得作用于新执行
+    session.loadGraph(COND_GRAPH);
+    const gen2 = session.generation;
+    const s2 = session.getSnapshot()!;
+    expect(s2.status).toBe("idle");
+    expect(s2.eventsExecuted).toBe(0);
+    // 一路跑到结束都不应停（规则已被清除）
+    expect(session.setBreakpoints([], gen2)).toEqual({ ok: true });
+    for (let i = 0; i < 100; i++) {
+      const r = session.step(gen2);
+      expect(r).toEqual({ ok: true });
+      if (session.getSnapshot()!.status === "done") break;
+    }
+    expect(session.getSnapshot()!.status).toBe("done");
+  });
+
+  it("旧图的条件规则引用的变量在新图中不存在时，加载新图也不报错", () => {
+    const { session } = makeSession();
+    session.loadGraph(COND_GRAPH);
+    const gen = session.generation;
+    expect(
+      session.setConditionalBreakpoints(
+        [{ nodeId: "L", variable: "zero", equals: 0, hit: 1 }],
+        gen,
+      ),
+    ).toEqual({ ok: true });
+
+    // 新图没有 zero 变量、也没有 L 节点：旧规则若不清除会让 freshEngine 抛错
+    const result = session.loadGraph(ASSIGN_GRAPH);
+    expect(result).toEqual({ ok: true });
+    expect(session.getSnapshot()!.status).toBe("idle");
+    expect(session.getSnapshot()!.eventsExecuted).toBe(0);
+  });
+
+  it("运行中 / 已产生事件后修改条件被拒绝，需先重置", () => {
+    const { session } = makeSession(100);
+    session.loadGraph(COND_GRAPH);
+    const gen = session.generation;
+    session.step(gen); // 产生一个事件
+    const r = session.setConditionalBreakpoints(
+      [{ nodeId: "L", variable: "zero", equals: 0, hit: 1 }],
+      gen,
+    );
+    expect(r.ok).toBe(false);
+    expect((r as { error: string }).error).toMatch(/reset before/);
+
+    expect(session.reset(gen)).toEqual({ ok: true });
+    expect(
+      session.setConditionalBreakpoints(
+        [{ nodeId: "L", variable: "zero", equals: 0, hit: 1 }],
+        gen,
+      ),
+    ).toEqual({ ok: true });
+  });
+
+  it("条件命中后继续：待执行节点只执行一次，随后继续到结束", async () => {
+    const { session, pump, last } = makeSession(100);
+    session.loadGraph(COND_GRAPH);
+    const gen = session.generation;
+    session.setConditionalBreakpoints(
+      [{ nodeId: "b", variable: "i", equals: 0, hit: 1 }],
+      gen,
+    );
+
+    const p = session.continue(gen);
+    await Promise.resolve();
+    await pump.releaseAll();
+    await p;
+    // 停在第一次 b 前：事件序列 s,L,b,… 已执行 s,L = 2 个事件
+    expect(last().status).toBe("breakpoint");
+    expect(last().pendingBreakpoint!.nodeId).toBe("b");
+    expect(last().variables.i).toBe(0);
+    expect(last().eventsExecuted).toBe(2);
+
+    // 继续：恰好执行待执行的 b 一次，然后因后续不再命中而跑到结束
+    const p2 = session.continue(gen);
+    await Promise.resolve();
+    await pump.releaseAll();
+    await p2;
+    expect(last().status).toBe("done");
+    // 总共 11 个事件（s, L, 4×b, 4 次迭代返回 L, e）；b 恰好 4 次，
+    // 没有因为命中被执行两遍。
+    expect(last().eventsExecuted).toBe(11);
+    expect(last().trace.filter((t) => t.node === "b")).toHaveLength(4);
+    expect(last().variables.i).toBe(4);
+  });
+});
+
 describe("会话：回退", () => {
   it("回退到历史事件后状态一致，且可重新前进", async () => {
     const { session, pump, last } = makeSession(100);

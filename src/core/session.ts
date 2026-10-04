@@ -68,6 +68,9 @@ export class DebuggerSession {
     this.running = false;
     this.pauseRequested = false;
     this.graph = graph;
+    // 新执行代次：旧图的条件断点配置不允许作用于新图（普通节点断点仍按
+    // 节点 id 过滤保留）。
+    this.engineOptions.conditionalRules = [];
     // 过滤掉不属于新图的断点
     const known = new Set(graph.nodes.map((n) => n.id));
     this.breakpoints = new Set(
@@ -183,6 +186,8 @@ export class DebuggerSession {
     rules: ConditionalRule[],
     generation?: number,
   ): CmdResult {
+    const stale = this.checkGeneration(generation);
+    if (stale) return stale;
     if (!this.engine || !this.graph)
       return { ok: false, error: "no graph loaded" };
     if (this.running || this.engine.eventsExecuted !== 0)
@@ -193,7 +198,10 @@ export class DebuggerSession {
       this.engine = this.freshEngine();
     } catch (err) {
       this.engineOptions.conditionalRules = prior;
-      return { ok: false, error: String(err) };
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
     }
     this.emit();
     return OK;
